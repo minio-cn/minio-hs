@@ -1,0 +1,232 @@
+name: CI
+
+# Trigger the workflow on push or pull request, but only for the master branch
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+
+# This ensures that previous jobs for the PR are canceled when the PR is
+# updated.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref }}
+  cancel-in-progress: true
+
+# Env vars for tests
+env:
+  MINIO_ACCESS_KEY: minio
+  MINIO_SECRET_KEY: minio123
+  MINIO_LOCAL: 1
+  MINIO_SECURE: 1
+
+jobs:
+  ormolu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: mrkkrp/ormolu-action@v8
+
+  hlint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: 'Set up HLint'
+      uses: haskell/actions/hlint-setup@v2
+      with:
+        version: '3.5'
+
+    - name: 'Run HLint'
+      uses: haskell/actions/hlint-run@v2
+      with:
+        path: '["src/", "test/", "examples"]'
+        fail-on: warning
+
+  cabal:
+    name: ${{ matrix.os }} / ghc-${{ matrix.ghc }} / cabal-${{ matrix.cabal }}
+    runs-on: ${{ matrix.os }}
+    needs: ormolu
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest] # Removed macos-latest due to cert issues.
+        cabal: ["3.6", "3.8"]
+        ghc:
+          - "9.2.4"
+          - "9.0.2"
+          - "8.10.7"
+          - "8.8.4"
+          - "8.6.5"
+        # exclude:
+        #   - os: macOS-latest
+        #     ghc: 8.8.4
+        #   - os: macOS-latest
+        #     ghc: 8.6.5
+        #   - os: windows-latest
+        #     ghc: 8.10.7
+        #   - os: windows-latest
+        #     ghc: 8.6.5
+
+    steps:
+    - uses: actions/checkout@v3
+      if: github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.ref == 'refs/heads/master'
+
+    - uses: haskell/actions/setup@v2
+      id: setup-haskell-cabal
+      name: Setup Haskell
+      with:
+        ghc-version: ${{ matrix.ghc }}
+        cabal-version: ${{ matrix.cabal }}
+
+    - name: Configure
+      run: |
+        cabal configure --enable-tests --enable-benchmarks --test-show-details=direct -fexamples -fdev -flive-test
+
+    - name: Freeze
+      run: |
+        cabal freeze
+
+    - uses: actions/cache@v3
+      name: Cache ~/.cabal/packages, ~/.cabal/store and dist-newstyle
+      with:
+        path: |
+          ~/.cabal/packages
+          ~/.cabal/store
+          dist-newstyle
+        key: ${{ runner.os }}-${{ matrix.ghc }}-${{ hashFiles('**/*.cabal', '**/cabal.project', '**/cabal.project.freeze') }}
+        restore-keys: ${{ runner.os }}-${{ matrix.ghc }}-
+
+    - name: Install dependencies
+      run: |
+        cabal build --only-dependencies
+
+    - name: Build
+      run: |
+        cabal build
+
+    - name: Setup MinIO for testing (Linux)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        mkdir -p /tmp/minio /tmp/minio-config/certs
+        cp test/cert/* /tmp/minio-config/certs/
+        (cd /tmp/minio; wget -q https://dl.min.io/server/minio/release/linux-amd64/minio; chmod +x ./minio)
+        sudo cp /tmp/minio-config/certs/public.crt /usr/local/share/ca-certificates/
+        sudo update-ca-certificates
+
+    - name: Setup MinIO for testing (MacOS)
+      if: matrix.os == 'macos-latest'
+      run: |
+        mkdir -p /tmp/minio /tmp/minio-config/certs
+        cp test/cert/* /tmp/minio-config/certs/
+        (cd /tmp/minio; wget -q https://dl.min.io/server/minio/release/darwin-amd64/minio; chmod +x ./minio)
+        sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain /tmp/minio-config/certs/public.crt
+
+    - name: Setup MinIO for testing (Windows)
+      if: matrix.os == 'windows-latest'
+      run: |
+        New-Item -ItemType Directory -Path "$env:temp/minio-config/certs/"
+        Copy-Item -Path test\cert\* -Destination "$env:temp/minio-config/certs/"
+        Invoke-WebRequest -Uri https://dl.minio.io/server/minio/release/windows-amd64/minio.exe -OutFile $HOME/minio.exe
+        Import-Certificate -FilePath "$env:temp/minio-config/certs/public.crt" -CertStoreLocation Cert:\LocalMachine\Root
+
+    - name: Test (Non-Windows)
+      if: matrix.os != 'windows-latest'
+      run: |
+        /tmp/minio/minio server --quiet --certs-dir /tmp/minio-config/certs data1 data2 data3 data4 2>&1 > minio.log &
+        ghc --version
+        cabal --version
+        cabal test
+
+    - name: Test (Windows)
+      if: matrix.os == 'windows-latest'
+      run: |
+        Start-Process -NoNewWindow -FilePath "$HOME/minio.exe" -ArgumentList "--certs-dir", "$env:temp/minio-config/certs", "server", "$env:temp/data1", "$env:temp/data2", "$env:temp/data3", "$env:temp/data4"
+        ghc --version
+        cabal --version
+        cabal test
+
+  stack:
+    name: stack / ghc ${{ matrix.ghc }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        ghc:
+          - "8.10.7"
+          - "9.0.2"
+          - "9.2.4"
+        os: [ubuntu-latest]
+
+    steps:
+    - uses: actions/checkout@v2
+      if: github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.ref == 'refs/heads/master'
+
+    - uses: haskell/actions/setup@v2
+      name: Setup Haskell Stack
+      with:
+        enable-stack: true
+        ghc-version: ${{ matrix.ghc }}
+        stack-version: 'latest'
+
+    - uses: actions/cache@v3
+      name: Cache ~/.stack
+      with:
+        path: ~/.stack
+        key: ${{ runner.os }}-stack-global-${{ hashFiles('stack.yaml') }}-${{ hashFiles('package.yaml') }}
+        restore-keys: |
+          ${{ runner.os }}-stack-global-
+    - uses: actions/cache@v3
+      name: Cache .stack-work
+      with:
+        path: .stack-work
+        key: ${{ runner.os }}-stack-work-${{ hashFiles('stack.yaml') }}-${{ hashFiles('package.yaml') }}-${{ hashFiles('**/*.hs') }}
+        restore-keys: |
+          ${{ runner.os }}-stack-work-
+
+    - name: Install dependencies
+      run: |
+        stack build --system-ghc --test --bench --no-run-tests --no-run-benchmarks --only-dependencies
+
+    - name: Build
+      run: |
+        stack build --system-ghc --test --bench --no-run-tests --no-run-benchmarks --flag minio-hs:examples --flag minio-hs:live-test --flag minio-hs:dev
+
+    - name: Setup MinIO for testing (Linux)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        mkdir -p /tmp/minio /tmp/minio-config/certs
+        cp test/cert/* /tmp/minio-config/certs/
+        (cd /tmp/minio; wget -q https://dl.min.io/server/minio/release/linux-amd64/minio; chmod +x ./minio)
+        sudo cp /tmp/minio-config/certs/public.crt /usr/local/share/ca-certificates/
+        sudo update-ca-certificates
+
+    - name: Setup MinIO for testing (MacOS)
+      if: matrix.os == 'macos-latest'
+      run: |
+        mkdir -p /tmp/minio /tmp/minio-config/certs
+        cp test/cert/* /tmp/minio-config/certs/
+        (cd /tmp/minio; wget -q https://dl.min.io/server/minio/release/darwin-amd64/minio; chmod +x ./minio)
+        sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain /tmp/minio-config/certs/public.crt
+
+    - name: Setup MinIO for testing (Windows)
+      if: matrix.os == 'windows-latest'
+      run: |
+        New-Item -ItemType Directory -Path "$env:temp/minio-config/certs/"
+        Copy-Item -Path test\cert\* -Destination "$env:temp/minio-config/certs/"
+        Invoke-WebRequest -Uri https://dl.minio.io/server/minio/release/windows-amd64/minio.exe -OutFile $HOME/minio.exe
+        Import-Certificate -FilePath "$env:temp/minio-config/certs/public.crt" -CertStoreLocation Cert:\LocalMachine\Root
+
+    - name: Test (Non-Windows)
+      if: matrix.os != 'windows-latest'
+      run: |
+        /tmp/minio/minio server --quiet --certs-dir /tmp/minio-config/certs data1 data2 data3 data4 2>&1 > minio.log &
+        ghc --version
+        stack --version
+        stack test --system-ghc --flag minio-hs:live-test --flag minio-hs:dev
+
+    - name: Test (Windows)
+      if: matrix.os == 'windows-latest'
+      run: |
+        Start-Process -NoNewWindow -FilePath "$HOME/minio.exe" -ArgumentList "--certs-dir", "$env:temp/minio-config/certs", "server", "$env:temp/data1", "$env:temp/data2", "$env:temp/data3", "$env:temp/data4"
+        ghc --version
+        cabal --version
+        stack test --system-ghc --flag minio-hs:live-test --flag minio-hs:dev
